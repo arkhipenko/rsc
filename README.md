@@ -7,7 +7,7 @@ Reliable Serial Communications (RSC) sends typed messages over a serial byte str
 ## Installation
 
 - Arduino IDE: copy the repository into the `libraries` folder. The library is not in the Library Manager.
-- PlatformIO: `lib_deps = https://github.com/arkhipenko/rsc.git#v1.1.0`. The repository is private, so the build machine needs read access to it.
+- PlatformIO: `lib_deps = https://github.com/arkhipenko/rsc.git#v1.1.0`.
 - Other build systems: compile `src/rsc_framework.c` and `src/rsc_crc.c`, and add `src` to the include path.
 
 ## Supported platforms
