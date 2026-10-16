@@ -1,0 +1,35 @@
+{
+  "name": "Reliable Serial Communications",
+  "keywords": "serial, uart, protocol, framing, crc, ack, nack, reliable, communication",
+  "description": "Framed messages over a serial byte stream: start marker, inverted length, CRC-16, correlation ids, ACK and NACK, retries. Plain C with a platform layer the application supplies.",
+  "repository":
+  {
+    "type": "git",
+    "url": "https://github.com/arkhipenko/rsc.git"
+  },
+  "authors":
+  [
+    {
+      "name": "Anatoli Arkhipenko",
+      "email": "arkhipenko@hotmail.com",
+      "url": "https://github.com/arkhipenko",
+      "maintainer": true
+    }
+  ],
+  "version": "1.1.0",
+  "license": "BSD-3-Clause",
+  "headers": "rsc_framework.h",
+  "frameworks": "*",
+  "platforms": "*",
+  "export": {
+    "include": [
+      "src",
+      "examples",
+      "library.json",
+      "library.properties",
+      "keywords.txt",
+      "LICENSE.txt",
+      "README.md"
+    ]
+  }
+}

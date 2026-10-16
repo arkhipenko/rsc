@@ -1,0 +1,15 @@
+# Claude Code and Design Central local files (.mcp.json and .dc/ hold an access token)
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+.dc/
+claude-start
+
+# Folders starting with '_'
+_*/
+
+# Host test build output
+tests/host/test_rsc
+tests/host/test_rsc_nolegacy
+tests/host/*.o
