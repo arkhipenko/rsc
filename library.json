@@ -1,7 +1,7 @@
 {
-  "name": "Reliable Serial Communications",
-  "keywords": "serial, uart, protocol, framing, crc, ack, nack, reliable, communication",
-  "description": "Framed messages over a serial byte stream: start marker, inverted length, CRC-16, correlation ids, ACK and NACK, retries. Plain C with a platform layer the application supplies.",
+  "name": "ReliableSerialComms",
+  "keywords": "serial, uart, protocol, cobs, crc, ack, nack, reliable, retransmission, request, response, communication",
+  "description": "Reliable messages over a serial line: COBS framing, CRC-16, a sliding window, retransmission, peer restart detection, and request and response tags. Plain C without heap; a wire-compatible Python package is included.",
   "repository":
   {
     "type": "git",
@@ -16,9 +16,9 @@
       "maintainer": true
     }
   ],
-  "version": "1.1.0",
+  "version": "2.0.0",
   "license": "BSD-3-Clause",
-  "headers": "rsc_framework.h",
+  "headers": "ReliableSerialComms.h",
   "frameworks": "*",
   "platforms": "*",
   "export": {

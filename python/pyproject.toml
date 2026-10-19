@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reliableserialcomms"
+version = "2.0.0"
+description = "Reliable messages over a serial line: COBS framing, CRC-16, sliding window, request and response tags. Wire-compatible with the ReliableSerialComms C library."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "Anatoli Arkhipenko", email = "arkhipenko@hotmail.com" }]
+dependencies = ["pyserial>=3.4"]
+
+[project.urls]
+Repository = "https://github.com/arkhipenko/rsc"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["reliableserialcomms"]

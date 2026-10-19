@@ -1,7 +1,9 @@
 # Continuous integration for ReliableSerialComms
-# - host tests (tests/host) with AddressSanitizer and UndefinedBehaviorSanitizer, against a
-#   loopback model of the platform layer; default build, RSC_NO_LEGACY build, C++ syntax check
-# - example sketches compiled on arduino-esp32 3.x (ESP32, ESP32-C3) and 2.0.17 (ESP32)
+# - host tests (tests/host) with AddressSanitizer and UndefinedBehaviorSanitizer: two links joined
+#   by a simulated wire with faults, in three configurations; C++ syntax check of the sources
+# - Python tests (python/tests): codec, two Python links, and interop with the C library
+#   (tests/interop/c_peer.c) over pipes, including a lossy pipe and a peer restart
+# - example sketches on arduino-esp32 3.x (ESP32, ESP32-C3), 2.0.17 (ESP32) and Arduino AVR (Uno)
 #   (examples/rsc_stm32 is an STM32CubeIDE fragment and is not compiled)
 # - Arduino Lint (the library is not in the Library Manager)
 
@@ -28,6 +30,26 @@ jobs:
       - name: Build and run
         run: make -C tests/host CXX=${{ matrix.compiler }} STD=${{ matrix.std }}
 
+  python:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install pyserial pytest
+      - name: Build the C peer
+        run: make -C tests/interop c_peer
+      - name: Test
+        working-directory: python
+        run: python -m pytest -q tests
+
   examples:
     name: Examples (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -35,43 +57,43 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: core 3.x, ESP32
+          - name: arduino-esp32 3.x, ESP32
             fqbn: esp32:esp32:esp32
-            core: ""
-          - name: core 3.x, ESP32-C3
+            platforms: |
+              - name: esp32:esp32
+                source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+            sketches: |
+              - examples/RSC_Host
+              - examples/RSC_TwoLinks
+          - name: arduino-esp32 3.x, ESP32-C3
             fqbn: esp32:esp32:esp32c3
-            core: ""
-          - name: core 2.0.17, ESP32
+            platforms: |
+              - name: esp32:esp32
+                source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+            sketches: |
+              - examples/RSC_Host
+          - name: arduino-esp32 2.0.17, ESP32
             fqbn: esp32:esp32:esp32
-            core: "2.0.17"
+            platforms: |
+              - name: esp32:esp32
+                source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+                version: 2.0.17
+            sketches: |
+              - examples/RSC_Host
+              - examples/RSC_TwoLinks
+          - name: Arduino AVR, Uno
+            fqbn: arduino:avr:uno
+            platforms: |
+              - name: arduino:avr
+            sketches: |
+              - examples/RSC_Host
     steps:
       - uses: actions/checkout@v7
-      - name: Latest core
-        if: matrix.core == ''
-        uses: arduino/compile-sketches@v1
+      - uses: arduino/compile-sketches@v1
         with:
           fqbn: ${{ matrix.fqbn }}
-          platforms: |
-            - name: esp32:esp32
-              source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          sketch-paths: |
-            - examples/RSC_Loopback
-            - examples/RSC_Poll
-          cli-compile-flags: |
-            - --warnings
-            - all
-      - name: Pinned core ${{ matrix.core }}
-        if: matrix.core != ''
-        uses: arduino/compile-sketches@v1
-        with:
-          fqbn: ${{ matrix.fqbn }}
-          platforms: |
-            - name: esp32:esp32
-              source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
-              version: ${{ matrix.core }}
-          sketch-paths: |
-            - examples/RSC_Loopback
-            - examples/RSC_Poll
+          platforms: ${{ matrix.platforms }}
+          sketch-paths: ${{ matrix.sketches }}
           cli-compile-flags: |
             - --warnings
             - all

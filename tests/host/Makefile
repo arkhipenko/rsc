@@ -1,41 +1,52 @@
-# Host tests for ReliableSerialComms: the library against a loopback model of the platform layer.
-# make                      - build and run the default and the RSC_NO_LEGACY build, and check the sources as C++
+# Host tests for ReliableSerialComms: two links joined by a simulated wire with faults.
+# make                      - build and run three configurations, and check the sources as C++
 # make CXX=clang++ STD=c++20
-# The C sources are built with gcc, or with clang when CXX is clang++.
+# The C sources are built as C99 with gcc, or with clang when CXX is clang++.
+#
+# Builds:
+#   test_rsc          defaults (MTU 256, 8 slots, window 4, byte-table CRC)
+#   test_rsc_small    the AVR defaults (MTU 64, 2 slots, window 1, 2 requests, no counters, nibble CRC)
+#   test_rsc_wide     16 slots, window 7, bitwise CRC
 
 CXX  ?= g++
 STD  ?= gnu++17
 CC   := $(if $(findstring clang,$(CXX)),clang,gcc)
-CSTD ?= gnu99
+CSTD ?= c99
 
 SAN      = -fsanitize=address,undefined -fno-sanitize-recover=all
-COMMON   = -g -O1 -Wall -Wextra -Werror $(SAN) -I ../../src -I stubs
-CFLAGS   = -std=$(CSTD) $(COMMON)
-CXXFLAGS = -std=$(STD) $(COMMON) -DRSC_REPO_DIR=\"../..\"
-SRC      = ../../src/rsc_framework.c ../../src/rsc_crc.c
-TSRC     = test_rsc.cpp stubs/platform_model.cpp
-DEPS     = $(SRC) $(TSRC) $(wildcard ../../src/*.h) $(wildcard stubs/*.h) Makefile
+COMMON   = -g -O1 -Wall -Wextra -Werror $(SAN) -I ../../src
+CFLAGS   = -std=$(CSTD) -pedantic $(COMMON)
+CXXFLAGS = -std=$(STD) $(COMMON)
+SRC      = ../../src/rsc.c ../../src/rsc_cobs.c ../../src/rsc_crc.c
+DEPS     = $(SRC) test_rsc.cpp $(wildcard ../../src/*.h) Makefile
+
+SMALL    = -DRSC_MTU=64 -DRSC_TX_SLOTS=2 -DRSC_WINDOW=1 -DRSC_MAX_REQUESTS=2 -DRSC_STATS=0 -DRSC_CRC_IMPL=1
+WIDE     = -DRSC_TX_SLOTS=16 -DRSC_WINDOW=7 -DRSC_CRC_IMPL=0
 
 all: run
 
-test_rsc: $(DEPS)
-	$(CC) $(CFLAGS) -c ../../src/rsc_framework.c -o rsc_framework.o
-	$(CC) $(CFLAGS) -c ../../src/rsc_crc.c -o rsc_crc.o
-	$(CXX) $(CXXFLAGS) -o $@ $(TSRC) rsc_framework.o rsc_crc.o
+# $(1) target, $(2) defines
+define build
+$(1): $(DEPS)
+	$(CC) $(CFLAGS) $(2) -c ../../src/rsc.c -o $(1)_rsc.o
+	$(CC) $(CFLAGS) $(2) -c ../../src/rsc_cobs.c -o $(1)_cobs.o
+	$(CC) $(CFLAGS) $(2) -c ../../src/rsc_crc.c -o $(1)_crc.o
+	$(CXX) $(CXXFLAGS) $(2) -o $(1) test_rsc.cpp $(1)_rsc.o $(1)_cobs.o $(1)_crc.o
+endef
 
-test_rsc_nolegacy: $(DEPS)
-	$(CC) $(CFLAGS) -DRSC_NO_LEGACY -c ../../src/rsc_framework.c -o rsc_framework_nolegacy.o
-	$(CC) $(CFLAGS) -DRSC_NO_LEGACY -c ../../src/rsc_crc.c -o rsc_crc_nolegacy.o
-	$(CXX) $(CXXFLAGS) -DRSC_NO_LEGACY -o $@ $(TSRC) rsc_framework_nolegacy.o rsc_crc_nolegacy.o
+$(eval $(call build,test_rsc,))
+$(eval $(call build,test_rsc_small,$(SMALL)))
+$(eval $(call build,test_rsc_wide,$(WIDE)))
 
 cxx_check: cxx_check.cpp $(DEPS)
 	$(CXX) -std=$(STD) -Wall -Wextra -Werror -I ../../src -fsyntax-only cxx_check.cpp
 
-run: test_rsc test_rsc_nolegacy cxx_check
+run: test_rsc test_rsc_small test_rsc_wide cxx_check
 	./test_rsc
-	./test_rsc_nolegacy
+	./test_rsc_small
+	./test_rsc_wide
 
 clean:
-	rm -f test_rsc test_rsc_nolegacy *.o
+	rm -f test_rsc test_rsc_small test_rsc_wide *.o
 
 .PHONY: all run clean cxx_check

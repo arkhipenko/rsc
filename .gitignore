@@ -9,7 +9,17 @@ claude-start
 # Folders starting with '_'
 _*/
 
-# Host test build output
+# Host and interop test build output
 tests/host/test_rsc
-tests/host/test_rsc_nolegacy
+tests/host/test_rsc_small
+tests/host/test_rsc_wide
 tests/host/*.o
+tests/interop/c_peer
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+python/build/
+python/dist/

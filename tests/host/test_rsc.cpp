@@ -1,22 +1,16 @@
-// Host tests for ReliableSerialComms, against the loopback platform model in stubs/.
+// Host tests for ReliableSerialComms 2.x: two links joined by a simulated wire with faults.
 // Run all tests, or one: ./test_rsc <test name>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <fstream>
-#include <sstream>
+#include <functional>
+#include <random>
 #include <string>
 #include <vector>
 
-#include "rsc_framework.h"
-#include "rsc_crc.h"
-#include "platform_model.h"
-
-#ifndef RSC_REPO_DIR
-#define RSC_REPO_DIR "../.."
-#endif
+#include "rsc.h"
 
 static int failures = 0;
 
@@ -29,779 +23,1000 @@ static int failures = 0;
     if ( va_ != vb_ ) { printf("  FAIL %s:%d: %s == %s (%lld != %lld)\n", __FILE__, __LINE__, #a, #b, va_, vb_); failures++; } \
   } while (0)
 
+typedef std::vector<uint8_t> Bytes;
 
-// Helpers ====================================================================
+static Bytes hexBytes(const char* hex) {
+  Bytes b;
+  unsigned v;
+  int n;
+  while ( sscanf(hex, " %2x%n", &v, &n) == 1 ) {
+    b.push_back((uint8_t) v);
+    hex += n;
+  }
+  return b;
+}
 
-// Move every queued envelope onto the wire (the transmit task)
-static void pumpTransmit() {
-  rscEnvelope_t qd;
-  while ( rscTransmitLoopReady(&qd, 0) ) {
-    rscTransmitLoopSend(&qd);
-    if ( qd.rscEnvelopePayload.rscPayloadHeader.rscPayloadDataLen > RSC_EMB_DATA_LEN ) rscPlatformFree(qd.rscEnvelopePayload.rscPayloadData.ptr);
+
+// Simulation =================================================================
+static uint32_t simNow = 1000;
+
+struct Msg {
+  uint8_t type;
+  uint8_t tag;
+  Bytes   data;
+};
+
+struct Rsp {
+  uint8_t tag;
+  uint8_t event;
+  uint8_t type;
+  int8_t  error;
+  Bytes   data;
+};
+
+struct Peer {
+  const char*       name;
+  rscLink_t         link;
+  rscOps_t          ops;
+  rscConfig_t       cfg;
+  Bytes             out;                // written, not yet delivered
+  Bytes             capture;            // every byte written while capturing
+  bool              capturing;
+  uint32_t          nonce;              // 0: random
+  std::mt19937      rng;
+  std::vector<Msg>  msgs;
+  std::vector<Rsp>  rsps;
+  std::vector<uint8_t> events;
+  std::vector<std::pair<uint32_t, uint16_t> > deferred;  // (time, tag | 0x100 for a final ACK)
+  std::function<bool(Peer&, const rscMessage_t*)> handler;
+  int               lockDepth;
+  int               maxLockDepth;
+  bool              writeFails;
+
+  Peer(const char* n, uint32_t seed) : name(n), capturing(false), nonce(0), rng(seed),
+                                       lockDepth(0), maxLockDepth(0), writeFails(false) {
+    memset(&link, 0, sizeof(link));
+  }
+};
+
+static int opWrite(void* ctx, const uint8_t* data, size_t length) {
+  Peer* p = (Peer*) ctx;
+  if ( p->writeFails ) return -1;
+  p->out.insert(p->out.end(), data, data + length);
+  if ( p->capturing ) p->capture.insert(p->capture.end(), data, data + length);
+  return (int) length;
+}
+
+static uint32_t opMillis(void* ctx) {
+  (void) ctx;
+  return simNow;
+}
+
+static uint32_t opRandom(void* ctx) {
+  Peer* p = (Peer*) ctx;
+  return p->nonce ? p->nonce : (uint32_t) p->rng();
+}
+
+static void opLock(void* ctx) {
+  Peer* p = (Peer*) ctx;
+  p->lockDepth++;
+  if ( p->lockDepth > p->maxLockDepth ) p->maxLockDepth = p->lockDepth;
+}
+
+static void opUnlock(void* ctx) {
+  ((Peer*) ctx)->lockDepth--;
+}
+
+// The default responder: answers each request type in its own way
+static bool defaultHandler(Peer& p, const rscMessage_t* m) {
+  if ( m->tag == 0 ) return true;
+  switch ( m->type ) {
+    case 0x01: rscAck(&p.link, m->tag, m->data, m->length); break;
+    case 0x02: rscNack(&p.link, m->tag, RSC_ERROR_CMD_BAD_ARG, (const uint8_t*) "no", 2); break;
+    case 0x03: rscRespond(&p.link, m->tag, 0x33, m->data, m->length); break;
+    case 0x04:      // accepted now, done in 300 ms
+      rscProgress(&p.link, m->tag, NULL, 0);
+      p.deferred.push_back(std::make_pair(simNow + 300, (uint16_t) (m->tag | 0x100)));
+      break;
+    case 0x06:      // accepted now, still busy at 200 ms, done at 400 ms
+      rscProgress(&p.link, m->tag, NULL, 0);
+      p.deferred.push_back(std::make_pair(simNow + 200, (uint16_t) m->tag));
+      p.deferred.push_back(std::make_pair(simNow + 400, (uint16_t) (m->tag | 0x100)));
+      break;
+    default: break;   // 0x05 and others: no response
+  }
+  return true;
+}
+
+// Callbacks never run with the lock held, so they may queue messages
+static bool onMessage(rscLink_t* link, const rscMessage_t* m, void* user) {
+  (void) link;
+  Peer* p = (Peer*) user;
+  CHECK_EQ(p->lockDepth, 0);
+  if ( p->handler && !p->handler(*p, m) ) return false;
+  Msg r;
+  r.type = m->type;
+  r.tag = m->tag;
+  r.data.assign(m->data, m->data + m->length);
+  p->msgs.push_back(r);
+  return true;
+}
+
+static void onResponse(rscLink_t* link, const rscResponse_t* rsp, void* user) {
+  (void) link;
+  Peer* p = (Peer*) user;
+  CHECK_EQ(p->lockDepth, 0);
+  Rsp r;
+  r.tag = rsp->tag;
+  r.event = rsp->event;
+  r.type = rsp->type;
+  r.error = rsp->error;
+  if ( rsp->length ) r.data.assign(rsp->data, rsp->data + rsp->length);
+  p->rsps.push_back(r);
+}
+
+static void onEvent(rscLink_t* link, uint8_t event, void* user) {
+  (void) link;
+  CHECK_EQ(((Peer*) user)->lockDepth, 0);
+  ((Peer*) user)->events.push_back(event);
+}
+
+static rscError_t initPeer(Peer& p, uint16_t mtu = 0, uint8_t window = 0, bool withLock = true) {
+  memset(&p.ops, 0, sizeof(p.ops));
+  p.ops.write = opWrite;
+  p.ops.millis = opMillis;
+  p.ops.random = opRandom;
+  if ( withLock ) {
+    p.ops.lock = opLock;
+    p.ops.unlock = opUnlock;
+  }
+  p.ops.ctx = &p;
+  rscConfigDefaults(&p.cfg);
+  p.cfg.rtoMs = 40;
+  if ( mtu ) p.cfg.mtu = mtu;
+  if ( window ) p.cfg.window = window;
+  p.cfg.onMessage = onMessage;
+  p.cfg.onEvent = onEvent;
+  p.cfg.user = &p;
+  if ( !p.handler ) p.handler = defaultHandler;
+  p.out.clear();
+  return rscInit(&p.link, &p.cfg, &p.ops);
+}
+
+struct Wire {
+  double        drop;       // probability per byte
+  double        flip;       // probability per byte of one flipped bit
+  double        insert;     // probability per byte of an extra random byte
+  bool          cut;        // nothing arrives
+  bool          oneByte;    // deliver one byte per step
+  std::mt19937  rng;
+  Wire() : drop(0), flip(0), insert(0), cut(false), oneByte(false), rng(7) {}
+};
+
+static void deliver(Peer& from, Peer& to, Wire& w) {
+  if ( from.out.empty() ) return;
+  if ( w.cut ) {
+    from.out.clear();
+    return;
+  }
+  size_t n = w.oneByte ? 1 : from.out.size();
+  Bytes chunk(from.out.begin(), from.out.begin() + n);
+  from.out.erase(from.out.begin(), from.out.begin() + n);
+
+  std::uniform_real_distribution<double> u(0.0, 1.0);
+  Bytes got;
+  for (size_t i = 0; i < chunk.size(); i++) {
+    if ( w.insert > 0 && u(w.rng) < w.insert ) got.push_back((uint8_t) w.rng());
+    if ( w.drop > 0 && u(w.rng) < w.drop ) continue;
+    uint8_t b = chunk[i];
+    if ( w.flip > 0 && u(w.rng) < w.flip ) b ^= (uint8_t) (1u << (w.rng() % 8));
+    got.push_back(b);
+  }
+  if ( !got.empty() ) rscFeed(&to.link, got.data(), got.size());
+}
+
+static void runDeferred(Peer& p) {
+  for (size_t i = 0; i < p.deferred.size(); ) {
+    if ( (int32_t) (simNow - p.deferred[i].first) >= 0 ) {
+      uint8_t tag = (uint8_t) p.deferred[i].second;
+      if ( p.deferred[i].second & 0x100 ) rscAck(&p.link, tag, (const uint8_t*) "done", 4);
+      else rscProgress(&p.link, tag, (const uint8_t*) "\x32", 1);
+      p.deferred.erase(p.deferred.begin() + i);
+    }
+    else i++;
   }
 }
 
-// Read one frame with the blocking reader (the receive task)
-static rscError_t receiveFrame() {
-  if ( !rscReceiveLoopEnvelopeStart(0) ) return RSC_ERROR_GENERAL;
-  return rscReceiveLoopEnvelopeRead();
-}
-
-// Read every frame on the wire
-static void receiveAll() {
-  while ( modelWirePending() > 0 ) {
-    if ( rscReceiveLoopEnvelopeStart(0) ) rscReceiveLoopEnvelopeRead();
+// Advance the simulation by ms milliseconds
+static void pump(Peer& a, Peer& b, Wire& w, uint32_t ms) {
+  for (uint32_t t = 0; t < ms; t++) {
+    runDeferred(a);
+    runDeferred(b);
+    rscService(&a.link);
+    rscService(&b.link);
+    deliver(a, b, w);
+    deliver(b, a, w);
+    rscService(&a.link);
+    rscService(&b.link);
+    simNow++;
   }
 }
 
-static rscError_t sendData(uint32_t cid, const uint8_t* data, uint16_t len) {
-  rscMessageHeader_t h;
-  h.rscMessageType = RSC_MSG_TYPE_DATA;
-  h.rscMessageCID = cid;
-  h.rscPayloadDataLen = len;
-  return rscSendMessage(&h, data);
-}
-
-static const uint8_t* payloadOf(rscEnvelope_t& e) {
-  if ( e.rscEnvelopePayload.rscPayloadHeader.rscPayloadDataLen > RSC_EMB_DATA_LEN ) return e.rscEnvelopePayload.rscPayloadData.ptr;
-  return e.rscEnvelopePayload.rscPayloadData.data;
-}
-
-static void freePayload(rscEnvelope_t& e) {
-  if ( e.rscEnvelopePayload.rscPayloadHeader.rscPayloadDataLen > RSC_EMB_DATA_LEN ) rscPlatformFree(e.rscEnvelopePayload.rscPayloadData.ptr);
-}
-
-static void put16(std::vector<uint8_t>& f, uint16_t v) {
-  f.push_back((uint8_t) v);
-  f.push_back((uint8_t) (v >> 8));
-}
-
-// Build a frame by hand. dataBytes are the bytes sent after the message header.
-static std::vector<uint8_t> buildFrame(uint16_t len, uint16_t inv, uint8_t type, uint32_t cid, uint16_t dataLen,
-                                       const std::vector<uint8_t>& dataBytes, bool goodCrc = true) {
-  std::vector<uint8_t> f;
-  f.push_back(RSC_ENVELOPE_BYTE1);
-  f.push_back(RSC_ENVELOPE_BYTE2);
-  put16(f, len);
-  put16(f, inv);
-  size_t h = f.size();
-  f.push_back(type);
-  for (int i = 0; i < 4; i++) f.push_back((uint8_t) (cid >> (8 * i)));
-  put16(f, dataLen);
-  f.insert(f.end(), dataBytes.begin(), dataBytes.end());
-  uint16_t crc = rscCrc16(&f[h], f.size() - h, RSC_CRC16_INIT);
-  if ( !goodCrc ) crc ^= 0x0101;
-  put16(f, crc);
-  return f;
-}
-
-// A valid DATA frame with n data bytes 0, 1, 2, ...
-static std::vector<uint8_t> validFrame(uint32_t cid, uint16_t n, bool goodCrc = true) {
-  std::vector<uint8_t> d(n < RSC_EMB_DATA_LEN ? RSC_EMB_DATA_LEN : n, 0);
-  for (uint16_t i = 0; i < n; i++) d[i] = (uint8_t) i;
-  uint16_t len = (uint16_t) (RSC_MESSAGE_HEADER_LEN + d.size());
-  return buildFrame(len, (uint16_t) ~len, RSC_MSG_TYPE_DATA, cid, n, d, goodCrc);
-}
-
-static void push(const std::vector<uint8_t>& f) {
-  modelWirePush(f.data(), f.size());
-}
-
-static bool wireEquals(const char* hex) {
-  std::vector<uint8_t> expect;
-  unsigned int b;
-  int used;
-  while ( sscanf(hex, "%2x%n", &b, &used) == 1 ) {
-    expect.push_back((uint8_t) b);
-    hex += used;
-    while ( *hex == ' ' ) hex++;
+// Pump until cond() holds, at most ms milliseconds
+static bool pumpUntil(Peer& a, Peer& b, Wire& w, uint32_t ms, std::function<bool()> cond) {
+  for (uint32_t t = 0; t < ms; t++) {
+    if ( cond() ) return true;
+    pump(a, b, w, 1);
   }
-  return expect.size() == model.wHead && memcmp(expect.data(), model.wire, model.wHead) == 0;
+  return cond();
 }
 
-static void roundtrip(uint16_t n) {
-  std::vector<uint8_t> d(n);
-  for (uint16_t i = 0; i < n; i++) d[i] = (uint8_t) (i * 7 + 1);
-  CHECK_EQ(sendData(1000 + n, n ? d.data() : NULL, n), RSC_OK);
-  pumpTransmit();
-  CHECK_EQ(model.wHead, RSC_ENVELOPE_HEADER_LEN + RSC_MESSAGE_HEADER_LEN + (n < 4 ? 4 : n) + RSC_TRAILER_LEN);
-  CHECK_EQ(receiveFrame(), RSC_OK);
-  rscEnvelope_t e;
-  CHECK_EQ(rscPlatformDequeueReceiveData(&e, 0), RSC_OK);
-  CHECK_EQ(e.rscEnvelopePayload.rscPayloadHeader.rscMessageCID, 1000 + n);
-  CHECK_EQ(e.rscEnvelopePayload.rscPayloadHeader.rscPayloadDataLen, n);
-  CHECK(n == 0 || memcmp(payloadOf(e), d.data(), n) == 0);
-  freePayload(e);
+static bool connect(Peer& a, Peer& b, Wire& w) {
+  return pumpUntil(a, b, w, 3000, [&]() { return rscIsUp(&a.link) && rscIsUp(&b.link); });
 }
 
-static std::string readFile(const char* rel) {
-  std::ifstream f(std::string(RSC_REPO_DIR) + "/" + rel);
-  std::stringstream ss;
-  ss << f.rdbuf();
-  return ss.str();
+static int countEvent(const Peer& p, uint8_t e) {
+  int n = 0;
+  for (size_t i = 0; i < p.events.size(); i++) if ( p.events[i] == e ) n++;
+  return n;
+}
+
+static const Rsp* findRsp(const Peer& p, uint8_t tag, bool final = true) {
+  for (size_t i = 0; i < p.rsps.size(); i++) {
+    if ( p.rsps[i].tag == tag && ( !final || p.rsps[i].event != RSC_RESPONSE_PROGRESS ) ) return &p.rsps[i];
+  }
+  return NULL;
+}
+
+// Queue an event, pumping while the queue is full
+static void sendRetry(Peer& a, Peer& b, Wire& w, uint8_t type, const Bytes& data) {
+  for (int i = 0; i < 20000; i++) {
+    if ( rscSend(&a.link, type, data.data(), (uint16_t) data.size()) == RSC_OK ) return;
+    pump(a, b, w, 1);
+  }
+  CHECK(false);
+}
+
+static uint8_t requestRetry(Peer& a, Peer& b, Wire& w, uint8_t type, const Bytes& data, uint32_t timeout) {
+  uint8_t tag = 0;
+  for (int i = 0; i < 20000; i++) {
+    if ( rscRequest(&a.link, type, data.data(), (uint16_t) data.size(), timeout, onResponse, &a, &tag) == RSC_OK ) return tag;
+    pump(a, b, w, 1);
+  }
+  CHECK(false);
+  return 0;
 }
 
 
-// CRC and wire format ========================================================
-
+// Tests ======================================================================
 static void test_crc_check_value() {
-  const uint8_t s[] = { '1', '2', '3', '4', '5', '6', '7', '8', '9' };
-  CHECK_EQ(rscCrc16(s, sizeof(s), RSC_CRC16_INIT), 0x29B1);   // CRC-16/CCITT-FALSE
+  const char* s = "123456789";
+  CHECK_EQ(rscCrc16((const uint8_t*) s, 9, RSC_CRC16_INIT), 0x29B1);
+  // continuing a CRC over two parts gives the CRC of the whole
+  CHECK_EQ(rscCrc16((const uint8_t*) s + 4, 5, rscCrc16((const uint8_t*) s, 4, RSC_CRC16_INIT)), 0x29B1);
 }
 
-// The worked examples of the spec: little-endian on every host
-static void test_wire_golden_nack() {
-  CHECK_EQ(rscSendStatusNack(42, (int8_t) RSC_ERROR_REC_CRC, true), RSC_OK);
-  pumpTransmit();
-  CHECK(wireEquals("AA 55 0B 00 F4 FF AE 2A 00 00 00 02 00 DF 01 00 00 F4 C9"));
+static void cobsCase(const Bytes& in, const Bytes& expected) {
+  std::vector<uint8_t> out(RSC_COBS_MAX_ENCODED(in.size()) + 1);
+  size_t n = rscCobsEncode(in.data(), in.size(), out.data());
+  CHECK(Bytes(out.begin(), out.begin() + n) == expected);
+
+  Bytes streamed;
+  CHECK_EQ(rscCobsEncodeTo(in.data(), in.size(), [](void* ctx, const uint8_t* d, size_t len) -> int {
+    Bytes* s = (Bytes*) ctx;
+    s->insert(s->end(), d, d + len);
+    return (int) len;
+  }, &streamed), 0);
+  CHECK(streamed == expected);
+
+  Bytes back(in.size() + 1);
+  long m = rscCobsDecode(expected.data(), expected.size(), back.data(), back.size());
+  CHECK_EQ(m, (long) in.size());
+  CHECK(Bytes(back.begin(), back.begin() + (m > 0 ? m : 0)) == in);
 }
 
-static void test_wire_golden_data() {
-  const uint8_t d[] = { 1, 2, 3, 4, 5, 6 };
-  CHECK_EQ(sendData(16, d, 6), RSC_OK);
-  pumpTransmit();
-  CHECK(wireEquals("AA 55 0D 00 F2 FF DA 10 00 00 00 06 00 01 02 03 04 05 06 C3 3E"));
+static void test_cobs_vectors() {
+  // the examples of the COBS paper and its common summaries
+  cobsCase(hexBytes("00"), hexBytes("01 01"));
+  cobsCase(hexBytes("00 00"), hexBytes("01 01 01"));
+  cobsCase(hexBytes("00 11 00"), hexBytes("01 02 11 01"));
+  cobsCase(hexBytes("11 22 00 33"), hexBytes("03 11 22 02 33"));
+  cobsCase(hexBytes("11 22 33 44"), hexBytes("05 11 22 33 44"));
+  cobsCase(hexBytes("11 00 00 00"), hexBytes("02 11 01 01 01"));
+
+  Bytes in, exp;
+  for (int i = 1; i <= 254; i++) in.push_back((uint8_t) i);              // 01..FE
+  exp.push_back(0xFF); exp.insert(exp.end(), in.begin(), in.end());
+  cobsCase(in, exp);
+
+  in.clear(); exp.clear();
+  for (int i = 0; i <= 254; i++) in.push_back((uint8_t) i);              // 00..FE
+  exp.push_back(0x01); exp.push_back(0xFF);
+  for (int i = 1; i <= 254; i++) exp.push_back((uint8_t) i);
+  cobsCase(in, exp);
+
+  in.clear(); exp.clear();
+  for (int i = 1; i <= 255; i++) in.push_back((uint8_t) i);              // 01..FF
+  exp.push_back(0xFF);
+  for (int i = 1; i <= 254; i++) exp.push_back((uint8_t) i);
+  exp.push_back(0x02); exp.push_back(0xFF);
+  cobsCase(in, exp);
+
+  in.clear(); exp.clear();
+  for (int i = 2; i <= 255; i++) in.push_back((uint8_t) i);              // 02..FF 00
+  in.push_back(0x00);
+  exp.push_back(0xFF);
+  for (int i = 2; i <= 255; i++) exp.push_back((uint8_t) i);
+  exp.push_back(0x01); exp.push_back(0x01);
+  cobsCase(in, exp);
+
+  in.clear(); exp.clear();
+  for (int i = 3; i <= 255; i++) in.push_back((uint8_t) i);              // 03..FF 00 01
+  in.push_back(0x00); in.push_back(0x01);
+  exp.push_back(0xFE);
+  for (int i = 3; i <= 255; i++) exp.push_back((uint8_t) i);
+  exp.push_back(0x02); exp.push_back(0x01);
+  cobsCase(in, exp);
+
+  // malformed input
+  uint8_t buf[16];
+  Bytes cut = hexBytes("03 11");                 // a block cut short
+  CHECK_EQ(rscCobsDecode(cut.data(), cut.size(), buf, sizeof(buf)), -1);
+  Bytes zero = hexBytes("02 00 11");             // a 0x00 inside
+  CHECK_EQ(rscCobsDecode(zero.data(), zero.size(), buf, sizeof(buf)), -1);
+  Bytes big = hexBytes("05 11 22 33 44");        // longer than cap
+  CHECK_EQ(rscCobsDecode(big.data(), big.size(), buf, 3), -1);
+  CHECK_EQ(rscCobsDecode(big.data(), big.size(), buf, 4), 4);
 }
 
-static void test_wire_golden_ack() {
-  CHECK_EQ(rscSendStatusAck(42, 0), RSC_OK);
-  pumpTransmit();
-  CHECK(wireEquals("AA 55 0B 00 F4 FF A0 2A 00 00 00 00 00 00 00 00 00 13 5A"));
+// Bring two links up with fixed nonces, then check frames written byte for byte
+static void test_golden_frames() {
+#if RSC_MTU == 256
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  a.nonce = 0x12345678;
+  b.nonce = 0xCAFEBABE;
+  a.capturing = true;
+  CHECK_EQ(initPeer(a), RSC_OK);
+  CHECK_EQ(initPeer(b), RSC_OK);
+
+  // the first frame of A: a leading 0x00, then SYNC (version 2, nothing in flight, MTU 256)
+  rscService(&a.link);
+  CHECK(a.capture == hexBytes("00 01 03 02 02 01 08 01 78 56 34 12 53 D2 00"));
+  a.capturing = false;
+  a.capture.clear();
+  CHECK(connect(a, b, w));
+
+  // 5 events from A and 3 from B, all acknowledged: A sends SEQ 5 and expects 3
+  for (int i = 0; i < 5; i++) sendRetry(a, b, w, 0x20, Bytes());
+  for (int i = 0; i < 3; i++) sendRetry(b, a, w, 0x20, Bytes());
+  pumpUntil(a, b, w, 2000, [&]() { return rscQueued(&a.link) == 0 && rscQueued(&b.link) == 0; });
+  pump(a, b, w, 100);     // idle: the next frame starts with 0x00
+
+  // DATA, reliable, SEQ 5, ACK 3, type 0x10, request tag 1, data 01 00 02
+  a.capturing = true;
+  const uint8_t d[3] = { 0x01, 0x00, 0x02 };
+  uint8_t tag = 0;
+  CHECK_EQ(rscRequest(&a.link, 0x10, d, 3, 1000, onResponse, &a, &tag), RSC_OK);
+  CHECK_EQ(tag, 1);
+  rscService(&a.link);
+  CHECK(a.capture == hexBytes("00 02 5D 04 10 01 01 04 02 CF 94 00"));
+
+  // B acknowledges with a pure ACK 6 (type 0x10 gets no response)
+  b.capturing = true;
+  deliver(a, b, w);
+  rscService(&b.link);
+  CHECK(b.capture == hexBytes("00 05 30 01 BB 08 00"));
+#endif
 }
 
-static void test_roundtrip_sizes() {
-  const uint16_t sizes[] = { 0, 1, 3, 4, 5, 6, 300 };
-  for (uint16_t n : sizes) {
-    modelReset();
-    roundtrip(n);
+static void test_connect() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  CHECK_EQ(initPeer(a), RSC_OK);
+  CHECK_EQ(initPeer(b), RSC_OK);
+  CHECK(!rscIsUp(&a.link));
+  CHECK(connect(a, b, w));
+  pump(a, b, w, 500);
+  CHECK_EQ(countEvent(a, RSC_EVENT_UP), 1);
+  CHECK_EQ(countEvent(b, RSC_EVENT_UP), 1);
+  CHECK_EQ(countEvent(a, RSC_EVENT_PEER_RESET), 0);
+  CHECK_EQ(a.lockDepth, 0);
+  CHECK(a.maxLockDepth <= 1);
+}
+
+// One side starts long after the other
+static void test_connect_late_peer() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  CHECK_EQ(initPeer(a), RSC_OK);
+  for (int i = 0; i < 2000; i++) {
+    rscService(&a.link);
+    a.out.clear();
+    simNow++;
   }
-  CHECK_EQ(model.allocs, model.frees);
+  sendRetry(a, b, w, 0x21, hexBytes("AA"));      // queued while nobody listens
+  CHECK_EQ(initPeer(b), RSC_OK);
+  CHECK(connect(a, b, w));
+  pumpUntil(a, b, w, 1000, [&]() { return !b.msgs.empty(); });
+  CHECK_EQ(b.msgs.size(), 1u);
+  if ( !b.msgs.empty() ) CHECK(b.msgs[0].data == hexBytes("AA"));
 }
 
-static void test_resync_on_repeated_start_byte() {
-  const uint8_t junk[] = { 0x00, 0x13, RSC_ENVELOPE_BYTE1 };
-  modelWirePush(junk, sizeof(junk));
-  push(validFrame(5, 2));
-  receiveAll();
-  CHECK_EQ(modelQueueCount(model.rx), 1);
-}
+static void test_requests() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
 
+  uint8_t t1 = requestRetry(a, b, w, 0x01, hexBytes("01 02"), 1000);
+  uint8_t t2 = requestRetry(a, b, w, 0x02, Bytes(), 1000);
+  pumpUntil(a, b, w, 1000, [&]() { return findRsp(a, t1) && findRsp(a, t2); });
+  uint8_t t3 = requestRetry(a, b, w, 0x03, hexBytes("09 08 07"), 1000);
+  pumpUntil(a, b, w, 1000, [&]() { return findRsp(a, t3) != NULL; });
 
-// D3, D4, D5: length checks ==================================================
-
-static void test_d3_inverse_length_checked() {
-  std::vector<uint8_t> f = validFrame(9, 2);
-  f[4] = 0x00;
-  f[5] = 0x00;                       // inverse 0x0000 shares no bit with 0x000B
-  push(f);
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_BAD_LEN);
-  CHECK_EQ(modelQueueCount(model.rx), 0);
-}
-
-static void test_d4_length_above_embedded_data() {
-  // length 71 with data length 2: 1.0.0 wrote 64 bytes into the 4-byte field on the stack
-  std::vector<uint8_t> d(64, 0x5A);
-  push(buildFrame(7 + 64, (uint16_t) ~(7 + 64), RSC_MSG_TYPE_DATA, 1, 2, d));
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_BAD_LEN);
-  CHECK_EQ(modelQueueCount(model.rx), 0);
-}
-
-static void test_d4_length_above_heap_data() {
-  // length 47 with data length 10: 1.0.0 wrote 40 bytes into a 10-byte heap buffer
-  std::vector<uint8_t> d(40, 0x5A);
-  push(buildFrame(7 + 40, (uint16_t) ~(7 + 40), RSC_MSG_TYPE_DATA, 1, 10, d));
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_BAD_LEN);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-static void test_d4_length_below_data() {
-  std::vector<uint8_t> d(8, 0x5A);
-  push(buildFrame(7 + 8, (uint16_t) ~(7 + 8), RSC_MSG_TYPE_DATA, 1, 20, d));
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_BAD_LEN);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-static void test_d5_length_below_header() {
-  // length 3 with a correct inverse: 1.0.0 computed 3 - 7 as a size_t
-  std::vector<uint8_t> d(40, 0x77);
-  push(buildFrame(3, (uint16_t) ~3, RSC_MSG_TYPE_DATA, 1, 0, d));
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_BAD_LEN);
-}
-
-static void test_padded_length_accepted() {
-  // data length 0..4 always travels as 4 bytes: length 11
-  for (uint16_t n = 0; n <= 4; n++) {
-    modelReset();
-    push(validFrame(n, n));
-    CHECK_EQ(receiveFrame(), RSC_OK);
-    CHECK_EQ(modelQueueCount(model.rx), 1);
+  const Rsp* r = findRsp(a, t1);
+  CHECK(r != NULL);
+  if ( r ) {
+    CHECK_EQ(r->event, RSC_RESPONSE_ACK);
+    CHECK_EQ(r->type, RSC_TYPE_ACK);
+    CHECK(r->data == hexBytes("01 02"));
   }
-}
-
-
-// D6, D10, D11: sending ======================================================
-
-static void test_d6_no_leak_when_transmit_queue_full() {
-  uint8_t d[20] = { 0 };
-  model.tx.capacity = 0;
-  CHECK_EQ(sendData(1, d, sizeof(d)), RSC_ERROR_TRX_Q_FULL);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-static void test_d10_payload_above_32767() {
-  static uint8_t d[40000];
-  for (size_t i = 0; i < sizeof(d); i++) d[i] = (uint8_t) i;
-  CHECK_EQ(sendData(1, d, sizeof(d)), RSC_OK);
-  rscEnvelope_t qd;
-  CHECK(rscTransmitLoopReady(&qd, 0));
-  CHECK_EQ(rscTransmitLoopSend(&qd), RSC_OK);
-  rscPlatformFree(qd.rscEnvelopePayload.rscPayloadData.ptr);
-  CHECK_EQ(receiveFrame(), RSC_OK);
-  rscEnvelope_t e;
-  CHECK_EQ(rscPlatformDequeueReceiveData(&e, 0), RSC_OK);
-  CHECK(memcmp(payloadOf(e), d, sizeof(d)) == 0);
-  freePayload(e);
-}
-
-static void test_d11_data_length_limit() {
-  static uint8_t d[65535];
-  CHECK_EQ(sendData(1, d, 65529), RSC_ERROR_OVERFLOW);
-  CHECK_EQ(modelQueueCount(model.tx), 0);
-  CHECK_EQ(sendData(1, d, 65535), RSC_ERROR_OVERFLOW);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-static void test_max_data_length_roundtrip() {
-  roundtrip(65528);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-static void test_send_null_arguments() {
-  rscMessageHeader_t h;
-  h.rscMessageType = RSC_MSG_TYPE_DATA;
-  h.rscMessageCID = 1;
-  h.rscPayloadDataLen = 3;
-  CHECK_EQ(rscSendMessage(NULL, NULL), RSC_ERROR_NULL);
-  CHECK_EQ(rscSendMessage(&h, NULL), RSC_ERROR_NULL);
-}
-
-static void test_send_allocation_failure() {
-  uint8_t d[10] = { 0 };
-  model.failAllocAt = 1;
-  CHECK_EQ(sendData(1, d, sizeof(d)), RSC_ERROR_MEMORY);
-  CHECK_EQ(modelQueueCount(model.tx), 0);
-}
-
-
-// D7, D8, D9: replies ========================================================
-
-static void test_d7_nack_error_keeps_sign() {
-  CHECK_EQ(rscSendStatusNack(42, (int8_t) RSC_ERROR_REC_CRC, true), RSC_OK);
-  pumpTransmit();
-  receiveAll();
-  rscError_t rc = 0;
-  CHECK_EQ(rscWaitForAckNack(42, &rc, 10), RSC_OK);
-  CHECK_EQ(rc, RSC_ERROR_REC_CRC);
-}
-
-static void test_d8_ack_status_reported() {
-  CHECK_EQ(rscSendStatusAck(43, 5), RSC_OK);
-  pumpTransmit();
-  receiveAll();
-  rscError_t rc = -99;
-  CHECK_EQ(rscWaitForAckNack(43, &rc, 10), RSC_OK);
-  CHECK_EQ(rc, 5);
-}
-
-static void test_d8_reply_fields() {
-  rscReply_t r;
-  CHECK_EQ(rscSendStatusNack(7, (int8_t) RSC_ERROR_CMD_BAD_ARG, true), RSC_OK);
-  CHECK_EQ(rscSendStatusNack(8, (int8_t) RSC_ERROR_CMD_NOT_IMP, false), RSC_OK);
-  CHECK_EQ(rscSendStatusAck(9, 0), RSC_OK);
-  pumpTransmit();
-  receiveAll();
-  CHECK_EQ(rscWaitForReply(7, &r, 0), RSC_OK);
-  CHECK_EQ(r.type, RSC_MSG_TYPE_NACK);
-  CHECK_EQ(r.status, RSC_ERROR_CMD_BAD_ARG);
-  CHECK(r.resend);
-  CHECK_EQ(rscWaitForReply(8, &r, 0), RSC_OK);
-  CHECK_EQ(r.status, RSC_ERROR_CMD_NOT_IMP);
-  CHECK(!r.resend);
-  CHECK_EQ(rscWaitForReply(9, &r, 0), RSC_OK);
-  CHECK_EQ(r.type, RSC_MSG_TYPE_ACK);
-  CHECK_EQ(r.status, 0);
-  CHECK(!r.resend);
-  CHECK_EQ(rscWaitForReply(9, &r, 0), RSC_ERROR_TIMEOUT);       // taken once
-}
-
-static void test_nack_with_zero_error_is_not_success() {
-  CHECK_EQ(rscSendStatusNack(44, 0, false), RSC_OK);
-  pumpTransmit();
-  receiveAll();
-  rscError_t rc = 0;
-  CHECK_EQ(rscWaitForAckNack(44, &rc, 10), RSC_OK);
-  CHECK_EQ(rc, RSC_ERROR_GENERAL);
-}
-
-static void test_d9_wait_keeps_receive_order() {
-  const uint8_t a = 1, b = 2;
-  CHECK_EQ(sendData(100, &a, 1), RSC_OK);
-  CHECK_EQ(rscSendStatusAck(50, 0), RSC_OK);
-  CHECK_EQ(sendData(101, &b, 1), RSC_OK);
-  pumpTransmit();
-  receiveAll();
-  rscError_t rc = -1;
-  CHECK_EQ(rscWaitForAckNack(50, &rc, 10), RSC_OK);
-  rscEnvelope_t e1, e2;
-  CHECK_EQ(rscPlatformDequeueReceiveData(&e1, 0), RSC_OK);
-  CHECK_EQ(rscPlatformDequeueReceiveData(&e2, 0), RSC_OK);
-  CHECK_EQ(e1.rscEnvelopePayload.rscPayloadHeader.rscMessageCID, 100);
-  CHECK_EQ(e2.rscEnvelopePayload.rscPayloadHeader.rscMessageCID, 101);
-  CHECK_EQ(modelQueueCount(model.rx), 0);
-}
-
-static void test_d9_replies_stay_out_of_receive_queue() {
-  CHECK_EQ(rscSendStatusAck(7, 0), RSC_OK);
-  CHECK_EQ(rscSendStatusNack(8, -1, false), RSC_OK);
-  pumpTransmit();
-  receiveAll();
-  CHECK_EQ(modelQueueCount(model.rx), 0);
-  rscError_t rc;
-  CHECK_EQ(rscWaitForAckNack(7, &rc, 10), RSC_OK);
-  CHECK_EQ(rscWaitForAckNack(8, &rc, 10), RSC_OK);
-}
-
-static void test_d9_wait_delays_between_checks() {
-  model.millisStep = 1;               // so that a wait without delays still ends
-  rscError_t rc;
-  CHECK_EQ(rscWaitForAckNack(77, &rc, 20), RSC_ERROR_TIMEOUT);
-  CHECK(model.delayCalls > 0);
-}
-
-static void test_wait_timeout() {
-  rscReply_t r;
-  uint32_t t0 = model.now;
-  CHECK_EQ(rscWaitForReply(1, &r, 20), RSC_ERROR_TIMEOUT);
-  CHECK(model.now - t0 >= 20 && model.now - t0 <= 22);
-  model.delayCalls = 0;
-  CHECK_EQ(rscWaitForReply(1, &r, 0), RSC_ERROR_TIMEOUT);
-  CHECK_EQ(model.delayCalls, 0);
-  CHECK_EQ(rscWaitForReply(1, NULL, 0), RSC_ERROR_NULL);
-  CHECK_EQ(rscWaitForAckNack(1, NULL, 0), RSC_ERROR_NULL);
-}
-
-static void test_reply_arrives_during_wait() {
-  CHECK_EQ(rscSendStatusAck(60, 3), RSC_OK);
-  model.onDelay = [] () { pumpTransmit(); receiveAll(); };
-  rscError_t rc = 0;
-  CHECK_EQ(rscWaitForAckNack(60, &rc, 50), RSC_OK);
-  CHECK_EQ(rc, 3);
-}
-
-static void test_reply_table_replaces_oldest() {
-  for (uint32_t cid = 1; cid <= RSC_REPLY_SLOTS + 1; cid++) CHECK_EQ(rscSendStatusAck(cid, (int8_t) cid), RSC_OK);
-  pumpTransmit();
-  receiveAll();
-  rscReply_t r;
-  CHECK_EQ(rscWaitForReply(1, &r, 0), RSC_ERROR_TIMEOUT);      // oldest, replaced
-  for (uint32_t cid = 2; cid <= RSC_REPLY_SLOTS + 1; cid++) {
-    CHECK_EQ(rscWaitForReply(cid, &r, 0), RSC_OK);
-    CHECK_EQ(r.status, (int) cid);
+  r = findRsp(a, t2);
+  CHECK(r != NULL);
+  if ( r ) {
+    CHECK_EQ(r->event, RSC_RESPONSE_NACK);
+    CHECK_EQ(r->error, RSC_ERROR_CMD_BAD_ARG);
+    CHECK(r->data == hexBytes("6E 6F"));
   }
-  CHECK_EQ(model.criticalDepth, 0);
+  r = findRsp(a, t3);
+  CHECK(r != NULL);
+  if ( r ) {
+    CHECK_EQ(r->event, RSC_RESPONSE_DATA);
+    CHECK_EQ(r->type, 0x33);
+    CHECK(r->data == hexBytes("09 08 07"));
+  }
+  CHECK_EQ(a.rsps.size(), 3u);
+  CHECK(t1 != t2 && t2 != t3);
 }
 
-static void test_reply_same_cid_replaces() {
-  CHECK_EQ(rscSendStatusAck(9, 1), RSC_OK);
-  CHECK_EQ(rscSendStatusAck(9, 2), RSC_OK);
-  pumpTransmit();
-  receiveAll();
-  rscReply_t r;
-  CHECK_EQ(rscWaitForReply(9, &r, 0), RSC_OK);
-  CHECK_EQ(r.status, 2);
-  CHECK_EQ(rscWaitForReply(9, &r, 0), RSC_ERROR_TIMEOUT);
+// Without PROGRESS a slow command times out
+static void test_progress_timeout() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+
+  uint8_t t = requestRetry(a, b, w, 0x04, Bytes(), 200);     // done after 300 ms
+  pumpUntil(a, b, w, 2000, [&]() { return findRsp(a, t) != NULL; });
+  pump(a, b, w, 300);
+  CHECK_EQ(a.rsps.size(), 2u);
+  if ( a.rsps.size() == 2 ) {
+    CHECK_EQ(a.rsps[0].event, RSC_RESPONSE_PROGRESS);
+    CHECK_EQ(a.rsps[1].event, RSC_RESPONSE_TIMEOUT);
+  }
+#if RSC_STATS
+  CHECK_EQ(rscGetStats(&a.link)->lateResponses, 1);     // the ACK came too late
+#endif
 }
 
-static void test_reply_with_heap_payload_is_freed() {
-  std::vector<uint8_t> d(10, 0);
-  d[0] = 0xFB;                        // -5
-  push(buildFrame(7 + 10, (uint16_t) ~(7 + 10), RSC_MSG_TYPE_ACK, 70, 10, d));
-  CHECK_EQ(receiveFrame(), RSC_OK);
-  CHECK_EQ(model.allocs, model.frees);
-  rscReply_t r;
-  CHECK_EQ(rscWaitForReply(70, &r, 0), RSC_OK);
-  CHECK_EQ(r.status, -5);
-}
+// Each PROGRESS restarts the timeout: done at 400 ms with a 250 ms timeout
+static void test_progress_restarts_timeout() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
 
-
-// Reliable send ==============================================================
-
-enum { RESPOND_ACK, RESPOND_NACK_RESEND, RESPOND_NACK_KEEP, RESPOND_NONE };
-static std::vector<int> script;
-static int dataSeen;
-
-// The peer: answers each data message by the script (the last entry repeats)
-static void responder() {
-  pumpTransmit();
-  receiveAll();
-  rscEnvelope_t e;
-  while ( rscPlatformDequeueReceiveData(&e, 0) == RSC_OK ) {
-    uint32_t cid = e.rscEnvelopePayload.rscPayloadHeader.rscMessageCID;
-    freePayload(e);
-    int action = script.empty() ? RESPOND_NONE : script[(size_t) dataSeen < script.size() ? (size_t) dataSeen : script.size() - 1];
-    dataSeen++;
-    if ( action == RESPOND_ACK ) rscSendStatusAck(cid, 0);
-    if ( action == RESPOND_NACK_RESEND ) rscSendStatusNack(cid, (int8_t) RSC_ERROR_REC_CRC, true);
-    if ( action == RESPOND_NACK_KEEP ) rscSendStatusNack(cid, (int8_t) RSC_ERROR_CMD_BAD_ARG, false);
-    pumpTransmit();
-    receiveAll();
+  uint8_t t = requestRetry(a, b, w, 0x06, Bytes(), 250);
+  pumpUntil(a, b, w, 2000, [&]() { return findRsp(a, t) != NULL; });
+  CHECK_EQ(a.rsps.size(), 3u);
+  if ( a.rsps.size() == 3 ) {
+    CHECK_EQ(a.rsps[0].event, RSC_RESPONSE_PROGRESS);
+    CHECK_EQ(a.rsps[1].event, RSC_RESPONSE_PROGRESS);
+    CHECK(a.rsps[1].data == hexBytes("32"));
+    CHECK_EQ(a.rsps[2].event, RSC_RESPONSE_ACK);
   }
 }
 
-static rscError_t reliable(uint8_t attempts, rscReply_t* r) {
-  const uint8_t d[] = { 9, 8, 7, 6, 5, 4, 3, 2 };
-  rscMessageHeader_t h;
-  h.rscMessageType = RSC_MSG_TYPE_DATA;
-  h.rscMessageCID = rscGetNextCID();
-  h.rscPayloadDataLen = sizeof(d);
-  dataSeen = 0;
-  model.onDelay = responder;
-  return rscSendMessageReliable(&h, d, attempts, 30, r);
+static void test_progress_then_final() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+
+  uint8_t t = requestRetry(a, b, w, 0x04, Bytes(), 1000);
+  pumpUntil(a, b, w, 2000, [&]() { return findRsp(a, t) != NULL; });
+  CHECK_EQ(a.rsps.size(), 2u);
+  if ( a.rsps.size() == 2 ) {
+    CHECK_EQ(a.rsps[0].event, RSC_RESPONSE_PROGRESS);
+    CHECK_EQ(a.rsps[1].event, RSC_RESPONSE_ACK);
+    CHECK(a.rsps[1].data == hexBytes("64 6F 6E 65"));
+  }
 }
 
-static void test_reliable_ack_first() {
-  rscReply_t r;
-  script = { RESPOND_ACK };
-  CHECK_EQ(reliable(3, &r), RSC_OK);
-  CHECK_EQ(r.type, RSC_MSG_TYPE_ACK);
-  CHECK_EQ(dataSeen, 1);
-  CHECK_EQ(model.allocs, model.frees);
+static void test_timeout_and_void() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+
+  // no response at all
+  uint8_t t = requestRetry(a, b, w, 0x05, Bytes(), 100);
+  pump(a, b, w, 150);
+  const Rsp* r = findRsp(a, t);
+  CHECK(r != NULL && r->event == RSC_RESPONSE_TIMEOUT);
+  CHECK_EQ(b.msgs.size(), 1u);
+
+  // a request that times out before it leaves is withdrawn: B never sees it. An idle link
+  // does not notice a cut line, so an event in flight takes the link down first.
+  w.cut = true;
+  sendRetry(a, b, w, 0x22, hexBytes("01"));
+  pumpUntil(a, b, w, 10000, [&]() { return !rscIsUp(&a.link); });
+  CHECK_EQ(countEvent(a, RSC_EVENT_DOWN), 1);
+  b.msgs.clear();
+  uint8_t t2 = 0;
+  CHECK_EQ(rscRequest(&a.link, 0x01, NULL, 0, 50, onResponse, &a, &t2), RSC_OK);
+  pump(a, b, w, 100);
+  r = findRsp(a, t2);
+  CHECK(r != NULL && r->event == RSC_RESPONSE_TIMEOUT);
+  w.cut = false;
+  CHECK(connect(a, b, w));
+  pump(a, b, w, 300);
+  CHECK_EQ(b.msgs.size(), 1u);          // the event only
+  if ( !b.msgs.empty() ) CHECK_EQ(b.msgs[0].type, 0x22);
+  CHECK_EQ(rscQueued(&a.link), 0);
 }
 
-static void test_reliable_resend_then_ack() {
-  rscReply_t r;
-  script = { RESPOND_NACK_RESEND, RESPOND_ACK };
-  CHECK_EQ(reliable(3, &r), RSC_OK);
-  CHECK_EQ(r.type, RSC_MSG_TYPE_ACK);
-  CHECK_EQ(dataSeen, 2);
+static void test_arguments() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  rscConfig_t cfg;
+  rscOps_t ops;
+  rscConfigDefaults(&cfg);
+  memset(&ops, 0, sizeof(ops));
+  CHECK_EQ(rscInit(NULL, &cfg, &ops), RSC_ERROR_NULL);
+  CHECK_EQ(rscInit(&a.link, &cfg, &ops), RSC_ERROR_NULL);    // no write, no millis
+  ops.write = opWrite;
+  ops.millis = opMillis;
+  ops.lock = opLock;                                         // lock without unlock
+  CHECK_EQ(rscInit(&a.link, &cfg, &ops), RSC_ERROR_BAD_ARG);
+  ops.lock = NULL;
+  cfg.window = 8;
+  CHECK_EQ(rscInit(&a.link, &cfg, &ops), RSC_ERROR_BAD_ARG);
+  cfg.window = 0;
+  cfg.mtu = RSC_MTU + 1;
+  CHECK_EQ(rscInit(&a.link, &cfg, &ops), RSC_ERROR_BAD_ARG);
+
+  initPeer(a);
+  initPeer(b);
+  uint8_t big[RSC_MTU + 1];
+  memset(big, 1, sizeof(big));
+  CHECK_EQ(rscSend(&a.link, 0xF0, NULL, 0), RSC_ERROR_BAD_ARG);
+  CHECK_EQ(rscSend(&a.link, 0x01, NULL, 3), RSC_ERROR_NULL);
+  CHECK_EQ(rscSend(&a.link, 0x01, big, RSC_MTU + 1), RSC_ERROR_OVERFLOW);
+  CHECK_EQ(rscSend(&a.link, 0x01, big, RSC_MTU), RSC_OK);
+  CHECK_EQ(rscRequest(&a.link, 0xFF, NULL, 0, 100, onResponse, &a, NULL), RSC_ERROR_BAD_ARG);
+  CHECK_EQ(rscRespond(&a.link, 0, 0x01, NULL, 0), RSC_ERROR_BAD_ARG);
+  CHECK_EQ(rscRespond(&a.link, 128, 0x01, NULL, 0), RSC_ERROR_BAD_ARG);
+  CHECK_EQ(rscRespond(&a.link, 5, 0xFE, NULL, 0), RSC_ERROR_BAD_ARG);
+  CHECK_EQ(rscNack(&a.link, 5, -1, big, RSC_MTU), RSC_ERROR_OVERFLOW);   // error byte + data
+  CHECK_EQ(rscSend(NULL, 0x01, NULL, 0), RSC_ERROR_NULL);
+
+  // queue full
+  initPeer(a);
+  for (int i = 0; i < RSC_TX_SLOTS; i++) CHECK_EQ(rscSend(&a.link, 0x01, NULL, 0), RSC_OK);
+  CHECK_EQ(rscSend(&a.link, 0x01, NULL, 0), RSC_ERROR_QUEUE_FULL);
+  CHECK_EQ(rscQueued(&a.link), RSC_TX_SLOTS);
+
+  // no free tag
+  initPeer(a);
+  int ok = 0;
+  for (int i = 0; i < RSC_MAX_REQUESTS + 1 && i < RSC_TX_SLOTS; i++) {
+    if ( rscRequest(&a.link, 0x01, NULL, 0, 0, onResponse, &a, NULL) == RSC_OK ) ok++;
+  }
+  if ( RSC_TX_SLOTS > RSC_MAX_REQUESTS ) {
+    CHECK_EQ(ok, RSC_MAX_REQUESTS);
+    CHECK_EQ(rscRequest(&a.link, 0x01, NULL, 0, 0, onResponse, &a, NULL), RSC_ERROR_NO_TAG);
+  }
 }
 
-static void test_reliable_nack_keep_stops() {
-  rscReply_t r;
-  script = { RESPOND_NACK_KEEP };
-  CHECK_EQ(reliable(3, &r), RSC_OK);
-  CHECK_EQ(r.type, RSC_MSG_TYPE_NACK);
-  CHECK_EQ(r.status, RSC_ERROR_CMD_BAD_ARG);
-  CHECK(!r.resend);
-  CHECK_EQ(dataSeen, 1);
-}
+// Every event arrives once and in order, and every request is answered once, on a noisy line
+static void lossyRun(double drop, double flip, double insert, uint32_t seed, int events, int requests, uint8_t window) {
+  Peer a("A", seed), b("B", seed + 100);
+  Wire w;
+  w.drop = drop;
+  w.flip = flip;
+  w.insert = insert;
+  w.rng.seed(seed);
+  initPeer(a, 0, window);
+  initPeer(b, 0, window);
+  CHECK(connect(a, b, w));
 
-static void test_reliable_resend_on_last_attempt() {
-  rscReply_t r;
-  script = { RESPOND_NACK_RESEND };
-  CHECK_EQ(reliable(2, &r), RSC_OK);
-  CHECK_EQ(r.type, RSC_MSG_TYPE_NACK);
-  CHECK(r.resend);
-  CHECK_EQ(dataSeen, 2);
-}
-
-static void test_reliable_timeout() {
-  rscReply_t r;
-  script = { RESPOND_NONE };
-  CHECK_EQ(reliable(3, &r), RSC_ERROR_TIMEOUT);
-  CHECK_EQ(dataSeen, 3);
-  dataSeen = 0;
-  CHECK_EQ(reliable(0, &r), RSC_ERROR_TIMEOUT);          // 0 attempts count as 1
-  CHECK_EQ(dataSeen, 1);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-static void test_reliable_send_error() {
-  rscReply_t r;
-  script = { RESPOND_ACK };
-  model.tx.capacity = 0;
-  CHECK_EQ(reliable(3, &r), RSC_ERROR_TRX_Q_FULL);
-  CHECK_EQ(rscSendMessageReliable(NULL, NULL, 1, 1, &r), RSC_ERROR_NULL);
-}
-
-
-// Receive error paths (blocking reader) ======================================
-
-static void test_receive_partial_frame_frees() {
-  std::vector<uint8_t> f = validFrame(1, 30);
-  f.resize(f.size() - 10);
-  push(f);
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_TIMEOUT);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-static void test_receive_missing_crc_frees() {
-  std::vector<uint8_t> f = validFrame(1, 30);
-  f.resize(f.size() - 1);
-  push(f);
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_TIMEOUT);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-static void test_receive_bad_crc() {
-  push(validFrame(1, 30, false));
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_CRC);
-  push(validFrame(2, 2, false));
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_CRC);
-  CHECK_EQ(modelQueueCount(model.rx), 0);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-static void test_receive_out_of_memory() {
-  model.failAllocAt = 1;
-  push(validFrame(1, 30));
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_OOM);
-  receiveAll();                       // the stream recovers
-  push(validFrame(2, 30));
-  CHECK_EQ(receiveFrame(), RSC_OK);
-  CHECK_EQ(modelQueueCount(model.rx), 1);
-}
-
-static void test_receive_queue_full_frees() {
-  model.rx.capacity = 0;
-  push(validFrame(1, 30));
-  CHECK_EQ(receiveFrame(), RSC_ERROR_REC_Q_FULL);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-
-// Transmit ===================================================================
-
-static void test_transmit_poll() {
-  const uint8_t d[] = { 1, 2, 3, 4, 5, 6, 7 };
-  CHECK_EQ(rscTransmitPoll(), RSC_ERROR_TRX_Q_EMPTY);
-  CHECK_EQ(sendData(1, d, sizeof(d)), RSC_OK);
-  CHECK_EQ(rscTransmitPoll(), RSC_OK);
-  CHECK_EQ(rscTransmitPoll(), RSC_ERROR_TRX_Q_EMPTY);
-  CHECK_EQ(model.allocs, model.frees);
-  CHECK_EQ(receiveFrame(), RSC_OK);
-}
-
-static void test_transmit_send_failure_frees() {
-  const uint8_t d[] = { 1, 2, 3, 4, 5, 6, 7 };
-  for (int call = 1; call <= 3; call++) {
-    for (int shortSend = 0; shortSend <= 1; shortSend++) {
-      modelReset();
-      model.failSendAt = call;
-      model.shortSend = shortSend != 0;
-      CHECK_EQ(sendData(1, d, sizeof(d)), RSC_OK);
-      CHECK_EQ(rscTransmitPoll(), RSC_ERROR_GENERAL);
-      CHECK_EQ(model.allocs, model.frees);
+  std::vector<uint8_t> tags;
+  int sent = 0, asked = 0;
+  while ( sent < events || asked < requests ) {
+    if ( sent < events ) {
+      Bytes d;
+      d.push_back((uint8_t) sent);
+      d.push_back((uint8_t) (sent >> 8));
+      sendRetry(a, b, w, 0x22, d);
+      sent++;
+    }
+    if ( asked < requests && sent % 3 == 0 ) {
+      Bytes d;
+      d.push_back((uint8_t) asked);
+      tags.push_back(requestRetry(a, b, w, 0x01, d, 60000));
+      asked++;
     }
   }
-}
+  pumpUntil(a, b, w, 600000, [&]() {
+    return rscQueued(&a.link) == 0 && rscQueued(&b.link) == 0 && a.rsps.size() >= (size_t) requests;
+  });
 
-
-// Non-blocking receive =======================================================
-
-static void test_poll_byte_by_byte() {
-  std::vector<uint8_t> f = validFrame(31, 25);
-  for (size_t i = 0; i < f.size(); i++) {
-    modelWirePush(&f[i], 1);
-    CHECK_EQ(rscReceivePoll(), RSC_OK);
-    model.now += 5;
+  // events: exactly once, in order
+  int next = 0;
+  bool ordered = true;
+  for (size_t i = 0; i < b.msgs.size(); i++) {
+    if ( b.msgs[i].type != 0x22 ) continue;
+    int v = b.msgs[i].data[0] | (b.msgs[i].data[1] << 8);
+    if ( v != next ) ordered = false;
+    next++;
   }
-  rscEnvelope_t e;
-  CHECK_EQ(rscPlatformDequeueReceiveData(&e, 0), RSC_OK);
-  CHECK_EQ(e.rscEnvelopePayload.rscPayloadHeader.rscMessageCID, 31);
-  CHECK_EQ(payloadOf(e)[24], 24);
-  freePayload(e);
-  CHECK_EQ(model.allocs, model.frees);
-}
+  CHECK(ordered);
+  CHECK_EQ(next, events);
 
-static void test_poll_several_frames_and_junk() {
-  const uint8_t junk[] = { 0x00, RSC_ENVELOPE_BYTE1, RSC_ENVELOPE_BYTE1 };
-  push(validFrame(1, 2));
-  modelWirePush(junk, sizeof(junk));
-  push(validFrame(2, 30));
-  CHECK_EQ(rscSendStatusAck(3, 0), RSC_OK);
-  pumpTransmit();
-  CHECK_EQ(rscReceivePoll(), RSC_OK);
-  CHECK_EQ(modelQueueCount(model.rx), 2);
-  rscReply_t r;
-  CHECK_EQ(rscWaitForReply(3, &r, 0), RSC_OK);
-  rscEnvelope_t e;
-  while ( rscPlatformDequeueReceiveData(&e, 0) == RSC_OK ) freePayload(e);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-static void test_poll_gap_drops_frame() {
-  std::vector<uint8_t> f = validFrame(1, 30);
-  modelWirePush(f.data(), 20);
-  CHECK_EQ(rscReceivePoll(), RSC_OK);
-  model.now += RSC_DEFAULT_TOUT + 1;
-  CHECK_EQ(rscReceivePoll(), RSC_ERROR_REC_TIMEOUT);
-  CHECK_EQ(model.allocs, model.frees);
-  push(validFrame(2, 30));
-  CHECK_EQ(rscReceivePoll(), RSC_OK);
-  CHECK_EQ(modelQueueCount(model.rx), 1);
-  rscEnvelope_t e;
-  CHECK_EQ(rscPlatformDequeueReceiveData(&e, 0), RSC_OK);
-  CHECK_EQ(e.rscEnvelopePayload.rscPayloadHeader.rscMessageCID, 2);
-  freePayload(e);
-}
-
-static void test_poll_rejects_bad_frames() {
-  std::vector<uint8_t> bad = validFrame(1, 2);
-  bad[4] = bad[5] = 0;
-  push(bad);
-  CHECK_EQ(rscReceivePoll(), RSC_ERROR_REC_BAD_LEN);
-  std::vector<uint8_t> d(64, 0x5A);
-  push(buildFrame(7 + 64, (uint16_t) ~(7 + 64), RSC_MSG_TYPE_DATA, 1, 2, d));
-  CHECK_EQ(rscReceivePoll(), RSC_ERROR_REC_BAD_LEN);
-  push(validFrame(1, 30, false));
-  CHECK_EQ(rscReceivePoll(), RSC_ERROR_REC_CRC);
-  model.failAllocAt = model.allocCalls + 1;
-  push(validFrame(1, 30));
-  CHECK_EQ(rscReceivePoll(), RSC_ERROR_REC_OOM);
-  push(validFrame(5, 30));
-  CHECK_EQ(rscReceivePoll(), RSC_OK);
-  CHECK_EQ(modelQueueCount(model.rx), 1);
-  rscEnvelope_t e;
-  CHECK_EQ(rscPlatformDequeueReceiveData(&e, 0), RSC_OK);
-  CHECK_EQ(e.rscEnvelopePayload.rscPayloadHeader.rscMessageCID, 5);
-  freePayload(e);
-  CHECK_EQ(model.allocs, model.frees);
-}
-
-
-// Other ======================================================================
-
-static void test_next_cid() {
-  uint32_t a = rscGetNextCID();
-  CHECK_EQ(rscGetNextCID(), a + 1);
-  CHECK_EQ(model.criticalDepth, 0);
-  CHECK_EQ(model.criticalMax, 1);
-}
-
-static void test_version_consistency() {
-  char v[16];
-  snprintf(v, sizeof(v), "%d.%d.%d", RSC_VERSION_MAJOR, RSC_VERSION_MINOR, RSC_VERSION_RELEASE);
-  CHECK(strcmp(v, RSC_VERSION_STRING) == 0);
-  CHECK_EQ(RSC_VERSION, RSC_VERSION_MAJOR * 10000 + RSC_VERSION_MINOR * 100 + RSC_VERSION_RELEASE);
-
-  std::string ver = RSC_VERSION_STRING;
-  std::string json = readFile("library.json");
-  std::string props = readFile("library.properties");
-  std::string readme = readFile("README.md");
-  CHECK(json.find("\"version\": \"" + ver + "\"") != std::string::npos);
-  CHECK(props.find("\nversion=" + ver + "\n") != std::string::npos);
-  // the version line near the top, and the version history entry
-  CHECK(readme.substr(0, 400).find("Version " + ver) != std::string::npos);
-  size_t hist = readme.find("## Version history");
-  CHECK(hist != std::string::npos && readme.find("- **" + ver + "**", hist) != std::string::npos);
-}
-
-static void test_legacy_names() {
-#ifndef RSC_NO_LEGACY
-  rscEnvelope_t qd;
-  CHECK_EQ(RSC_MSG_TYPE_RES, RSC_MSG_TYPE_ACK);
-  CHECK_EQ(sizeof(rscRelayStatus_t), 9);
-  CHECK_EQ(rscSendStatusAck(1, 0), RSC_OK);
-  CHECK(rscTransmitLoopReady(&qd, 0));
-  CHECK_EQ(rscTrasmitLoopSend(&qd), RSC_OK);
-  uint8_t b = 0;
-  CHECK_EQ(rscPlatfromSendBytes(&b, 1), 1);
-#else
-#if defined(rscTrasmitLoopSend) || defined(RSC_MSG_TYPE_RES)
-#error "RSC_NO_LEGACY must hide the 1.0.0 names"
+  // requests: every one answered with its own data, once
+  CHECK_EQ(a.rsps.size(), (size_t) requests);
+  for (size_t i = 0; i < a.rsps.size(); i++) CHECK_EQ(a.rsps[i].event, RSC_RESPONSE_ACK);
+  CHECK_EQ(a.lockDepth, 0);
+#if RSC_STATS
+  if ( drop + flip + insert > 0 ) {
+    const rscStats_t* s = rscGetStats(&a.link);
+    CHECK(s->retransmits > 0);
+  }
 #endif
+}
+
+static void test_lossy_link() {
+  lossyRun(0.0, 0.0, 0.0, 11, 300, 60, 0);
+  lossyRun(0.01, 0.0, 0.0, 12, 300, 60, 0);
+  lossyRun(0.0, 0.01, 0.0, 13, 300, 60, 0);
+  lossyRun(0.0, 0.0, 0.01, 14, 300, 60, 0);
+  lossyRun(0.02, 0.02, 0.01, 15, 300, 60, 0);
+  lossyRun(0.02, 0.02, 0.01, 16, 200, 40, 1);
+  if ( RSC_TX_SLOTS >= 7 ) lossyRun(0.02, 0.02, 0.01, 17, 300, 60, 7);
+}
+
+// Up to the window of frames leaves before any ACK
+static void test_window() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+  pump(a, b, w, 50);
+
+  int n = RSC_TX_SLOTS < RSC_WINDOW ? RSC_TX_SLOTS : RSC_WINDOW;
+  for (int i = 0; i < RSC_TX_SLOTS; i++) rscSend(&a.link, 0x22, NULL, 0);
+  a.out.clear();
+  rscService(&a.link);
+  int frames = 0;
+  for (size_t i = 0; i < a.out.size(); i++) {
+    if ( a.out[i] == 0 && i > 0 && a.out[i - 1] != 0 ) frames++;
+  }
+  CHECK_EQ(frames, n);
+  CHECK_EQ(a.link.inFlight, n);
+}
+
+// A refused message pauses the sender until rscResume()
+static void test_not_ready() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  bool refuse = false;
+  b.handler = [&](Peer& p, const rscMessage_t* m) -> bool {
+    if ( refuse && m->data[0] == 3 ) return false;
+    return defaultHandler(p, m);
+  };
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+
+  // 0, 1, 2 are delivered, 3 is refused, 4 waits behind it (the queue may hold only 2)
+  refuse = true;
+  for (int i = 0; i < 5; i++) {
+    Bytes d(1, (uint8_t) i);
+    sendRetry(a, b, w, 0x22, d);
+  }
+  pump(a, b, w, 3000);
+  CHECK_EQ(b.msgs.size(), 3u);          // 0, 1, 2 delivered; 3 refused
+  CHECK(rscIsUp(&a.link));              // probing does not take the link down
+  CHECK(a.link.peerRnr);
+
+  refuse = false;
+  rscResume(&b.link);
+  sendRetry(a, b, w, 0x22, Bytes(1, 5));
+  pumpUntil(a, b, w, 1000, [&]() { return b.msgs.size() == 6; });
+  CHECK_EQ(b.msgs.size(), 6u);
+  for (size_t i = 0; i < b.msgs.size(); i++) CHECK_EQ(b.msgs[i].data[0], (int) i);
+}
+
+// The line breaks: the link goes down, keeps its queue, and comes back
+static void test_link_down_up() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+
+  w.cut = true;
+  for (int i = 0; i < RSC_TX_SLOTS; i++) {
+    Bytes d(1, (uint8_t) i);
+    CHECK_EQ(rscSend(&a.link, 0x22, d.data(), 1), RSC_OK);
+  }
+  pumpUntil(a, b, w, 10000, [&]() { return !rscIsUp(&a.link); });
+  CHECK_EQ(countEvent(a, RSC_EVENT_DOWN), 1);
+  pump(a, b, w, 2000);
+  w.cut = false;
+  CHECK(connect(a, b, w));
+  pumpUntil(a, b, w, 2000, [&]() { return rscQueued(&a.link) == 0; });
+  CHECK_EQ(b.msgs.size(), (size_t) RSC_TX_SLOTS);
+  for (size_t i = 0; i < b.msgs.size(); i++) CHECK_EQ(b.msgs[i].data[0], (int) i);
+  CHECK_EQ(countEvent(a, RSC_EVENT_PEER_RESET), 0);
+  CHECK_EQ(countEvent(b, RSC_EVENT_PEER_RESET), 0);
+}
+
+// B restarts: A sees PEER_RESET, fails the request B had received, and sends the rest to the new B
+static void peerResetRun(bool sameNonce) {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  if ( sameNonce ) b.nonce = 0x55AA55AA;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+
+  // traffic both ways, so that the sequence numbers are not at 0
+  for (int i = 0; i < 3; i++) sendRetry(a, b, w, 0x22, Bytes(1, 0x10));
+  for (int i = 0; i < 5; i++) sendRetry(b, a, w, 0x22, Bytes(1, 0x10));
+  pumpUntil(a, b, w, 2000, [&]() { return rscQueued(&a.link) == 0 && rscQueued(&b.link) == 0; });
+
+  // a request that B receives and never answers
+  uint8_t t = requestRetry(a, b, w, 0x05, Bytes(), 0);
+  pumpUntil(a, b, w, 2000, [&]() { return rscQueued(&a.link) == 0; });
+  CHECK(findRsp(a, t) == NULL);
+
+  // B restarts; A queues more while B is gone
+  w.cut = true;
+  b.msgs.clear();
+  b.events.clear();
+  initPeer(b);
+  sendRetry(a, b, w, 0x22, hexBytes("77"));
+  w.cut = false;
+  CHECK(connect(a, b, w));
+  pumpUntil(a, b, w, 3000, [&]() { return !b.msgs.empty(); });
+
+  if ( !sameNonce ) CHECK_EQ(countEvent(a, RSC_EVENT_PEER_RESET), 1);
+  CHECK(countEvent(a, RSC_EVENT_PEER_RESET) >= 1);
+  const Rsp* r = findRsp(a, t);
+  CHECK(r != NULL && r->event == RSC_RESPONSE_PEER_RESET);
+  CHECK_EQ(b.msgs.size(), 1u);
+  if ( !b.msgs.empty() ) CHECK(b.msgs[0].data == hexBytes("77"));
+
+  // and traffic flows both ways again
+  uint8_t t2 = requestRetry(a, b, w, 0x01, hexBytes("42"), 1000);
+  sendRetry(b, a, w, 0x23, hexBytes("43"));
+  pumpUntil(a, b, w, 2000, [&]() { return findRsp(a, t2) != NULL; });
+  r = findRsp(a, t2);
+  CHECK(r != NULL && r->event == RSC_RESPONSE_ACK);
+  pump(a, b, w, 200);
+  bool got = false;
+  for (size_t i = 0; i < a.msgs.size(); i++) if ( a.msgs[i].type == 0x23 ) got = true;
+  CHECK(got);
+}
+
+static void test_peer_reset() {
+  peerResetRun(false);
+}
+
+// A restarted peer that draws the same nonce is still detected by its sequence state
+static void test_peer_reset_same_nonce() {
+  peerResetRun(true);
+}
+
+// The smaller MTU wins. A request queued before the sync and longer than the peer's MTU is dropped.
+static void test_mtu() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b, 16);
+  Bytes big(32, 0x5A);
+  uint8_t t = 0;
+  CHECK_EQ(rscRequest(&a.link, 0x01, big.data(), 32, 1000, onResponse, &a, &t), RSC_OK);
+  sendRetry(a, b, w, 0x22, hexBytes("01"));
+  CHECK(connect(a, b, w));
+  CHECK_EQ(rscMtu(&a.link), 16);
+  CHECK_EQ(rscMtu(&b.link), 16);
+  pumpUntil(a, b, w, 1000, [&]() { return rscQueued(&a.link) == 0; });
+  const Rsp* r = findRsp(a, t);
+  CHECK(r != NULL && r->event == RSC_RESPONSE_DROPPED);
+  CHECK_EQ(b.msgs.size(), 1u);
+  CHECK_EQ(rscSend(&a.link, 0x22, big.data(), 17), RSC_ERROR_OVERFLOW);
+  CHECK_EQ(rscSend(&a.link, 0x22, big.data(), 16), RSC_OK);
+}
+
+static void test_one_byte_at_a_time() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  w.oneByte = true;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+  uint8_t t = requestRetry(a, b, w, 0x03, hexBytes("01 00 00 02"), 5000);
+  pumpUntil(a, b, w, 5000, [&]() { return findRsp(a, t) != NULL; });
+  const Rsp* r = findRsp(a, t);
+  CHECK(r != NULL && r->event == RSC_RESPONSE_DATA && r->data == hexBytes("01 00 00 02"));
+}
+
+// Timers keep working across the wrap of the millisecond counter
+static void test_clock_wrap() {
+  simNow = 0xFFFFFF00u;
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+  w.drop = 0.05;
+  for (int i = 0; i < 20; i++) requestRetry(a, b, w, 0x01, Bytes(1, (uint8_t) i), 20000);
+  pumpUntil(a, b, w, 60000, [&]() { return a.rsps.size() == 20; });
+  CHECK_EQ(a.rsps.size(), 20u);
+  CHECK(simNow < 0x80000000u);
+  simNow = 1000;
+}
+
+// Garbage, damaged frames and reserved bits never crash the link and never reach the application
+static void test_malformed() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+
+  std::mt19937 rng(99);
+  for (int i = 0; i < 20000; i++) {
+    uint8_t buf[64];
+    size_t n = rng() % sizeof(buf);
+    for (size_t k = 0; k < n; k++) buf[k] = (uint8_t) rng();
+    rscFeed(&a.link, buf, n);
+  }
+  // a valid frame with a reserved bit, and one with the "more" bit (after a delimiter that
+  // ends the garbage)
+  uint8_t f[8];
+  uint8_t enc[16];
+  uint8_t delim = 0;
+  rscFeed(&a.link, &delim, 1);
+  f[0] = 0x40; f[1] = 0x20; f[2] = 0x01; f[3] = 0x00;
+  uint16_t c = rscCrc16(f, 4, RSC_CRC16_INIT);
+  f[4] = (uint8_t) c; f[5] = (uint8_t) (c >> 8);
+  size_t n = rscCobsEncode(f, 6, enc);
+  enc[n++] = 0;
+  rscFeed(&a.link, enc, n);
+  f[1] = RSC_L1_MORE;
+  c = rscCrc16(f, 4, RSC_CRC16_INIT);
+  f[4] = (uint8_t) c; f[5] = (uint8_t) (c >> 8);
+  n = rscCobsEncode(f, 6, enc);
+  enc[n++] = 0;
+  rscFeed(&a.link, enc, n);
+
+  // the link survives (a random frame may have looked like a peer reset)
+  a.msgs.clear();
+  uint8_t zero = 0;
+  rscFeed(&a.link, &zero, 1);
+  CHECK(connect(a, b, w));
+  uint8_t t = requestRetry(b, a, w, 0x01, hexBytes("AB"), 5000);
+  pumpUntil(a, b, w, 5000, [&]() { return findRsp(b, t) != NULL; });
+  CHECK(findRsp(b, t) != NULL && findRsp(b, t)->event == RSC_RESPONSE_ACK);
+#if RSC_STATS
+  const rscStats_t* s = rscGetStats(&a.link);
+  CHECK(s->framingErrors + s->crcErrors > 1000);
+  CHECK(s->rejected >= 2);
 #endif
+}
+
+// Responses without a pending request are counted and dropped
+static void test_late_response() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+  CHECK_EQ(rscAck(&b.link, 77, NULL, 0), RSC_OK);
+  pump(a, b, w, 200);
+  CHECK_EQ(a.rsps.size(), 0u);
+#if RSC_STATS
+  CHECK_EQ(rscGetStats(&a.link)->lateResponses, 1);
+#endif
+}
+
+// A failing write does not break the link: the frames go again
+static void test_write_errors() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a);
+  initPeer(b);
+  CHECK(connect(a, b, w));
+  a.writeFails = true;
+  sendRetry(a, b, w, 0x22, hexBytes("99"));
+  pump(a, b, w, 20);
+  a.writeFails = false;
+  pumpUntil(a, b, w, 3000, [&]() { return !b.msgs.empty(); });
+  CHECK_EQ(b.msgs.size(), 1u);
+#if RSC_STATS
+  CHECK(rscGetStats(&a.link)->txErrors > 0);
+#endif
+}
+
+// The link works without lock operations (a single-threaded superloop)
+static void test_no_lock() {
+  Peer a("A", 1), b("B", 2);
+  Wire w;
+  initPeer(a, 0, 0, false);
+  initPeer(b, 0, 0, false);
+  CHECK(connect(a, b, w));
+  uint8_t t = requestRetry(a, b, w, 0x01, hexBytes("10"), 1000);
+  pumpUntil(a, b, w, 1000, [&]() { return findRsp(a, t) != NULL; });
+  CHECK(findRsp(a, t) != NULL);
 }
 
 
 // Runner =====================================================================
-
 struct TestCase {
   const char* name;
   void (*fn)();
 };
 
-#define T(f) { #f, f }
 static const TestCase tests[] = {
-  T(test_crc_check_value),
-  T(test_wire_golden_nack),
-  T(test_wire_golden_data),
-  T(test_wire_golden_ack),
-  T(test_roundtrip_sizes),
-  T(test_resync_on_repeated_start_byte),
-  T(test_d3_inverse_length_checked),
-  T(test_d4_length_above_embedded_data),
-  T(test_d4_length_above_heap_data),
-  T(test_d4_length_below_data),
-  T(test_d5_length_below_header),
-  T(test_padded_length_accepted),
-  T(test_d6_no_leak_when_transmit_queue_full),
-  T(test_d10_payload_above_32767),
-  T(test_d11_data_length_limit),
-  T(test_max_data_length_roundtrip),
-  T(test_send_null_arguments),
-  T(test_send_allocation_failure),
-  T(test_d7_nack_error_keeps_sign),
-  T(test_d8_ack_status_reported),
-  T(test_d8_reply_fields),
-  T(test_nack_with_zero_error_is_not_success),
-  T(test_d9_wait_keeps_receive_order),
-  T(test_d9_replies_stay_out_of_receive_queue),
-  T(test_d9_wait_delays_between_checks),
-  T(test_wait_timeout),
-  T(test_reply_arrives_during_wait),
-  T(test_reply_table_replaces_oldest),
-  T(test_reply_same_cid_replaces),
-  T(test_reply_with_heap_payload_is_freed),
-  T(test_reliable_ack_first),
-  T(test_reliable_resend_then_ack),
-  T(test_reliable_nack_keep_stops),
-  T(test_reliable_resend_on_last_attempt),
-  T(test_reliable_timeout),
-  T(test_reliable_send_error),
-  T(test_receive_partial_frame_frees),
-  T(test_receive_missing_crc_frees),
-  T(test_receive_bad_crc),
-  T(test_receive_out_of_memory),
-  T(test_receive_queue_full_frees),
-  T(test_transmit_poll),
-  T(test_transmit_send_failure_frees),
-  T(test_poll_byte_by_byte),
-  T(test_poll_several_frames_and_junk),
-  T(test_poll_gap_drops_frame),
-  T(test_poll_rejects_bad_frames),
-  T(test_next_cid),
-  T(test_version_consistency),
-  T(test_legacy_names),
+  { "crc_check_value", test_crc_check_value },
+  { "cobs_vectors", test_cobs_vectors },
+  { "golden_frames", test_golden_frames },
+  { "connect", test_connect },
+  { "connect_late_peer", test_connect_late_peer },
+  { "requests", test_requests },
+  { "progress_timeout", test_progress_timeout },
+  { "progress_restarts_timeout", test_progress_restarts_timeout },
+  { "progress_then_final", test_progress_then_final },
+  { "timeout_and_void", test_timeout_and_void },
+  { "arguments", test_arguments },
+  { "lossy_link", test_lossy_link },
+  { "window", test_window },
+  { "not_ready", test_not_ready },
+  { "link_down_up", test_link_down_up },
+  { "peer_reset", test_peer_reset },
+  { "peer_reset_same_nonce", test_peer_reset_same_nonce },
+  { "mtu", test_mtu },
+  { "one_byte_at_a_time", test_one_byte_at_a_time },
+  { "clock_wrap", test_clock_wrap },
+  { "malformed", test_malformed },
+  { "late_response", test_late_response },
+  { "write_errors", test_write_errors },
+  { "no_lock", test_no_lock },
 };
-
-// Empty the reply table and the poll parser between tests: RSC_REPLY_SLOTS fresh
-// replies replace whatever an earlier test left, then they are taken
-static void drainLibraryState() {
-  rscReply_t r;
-  for (uint32_t i = 0; i < RSC_REPLY_SLOTS; i++) rscSendStatusAck(0xFFFF0000u + i, 0);
-  pumpTransmit();
-  receiveAll();
-  for (uint32_t i = 0; i < RSC_REPLY_SLOTS; i++) rscWaitForReply(0xFFFF0000u + i, &r, 0);
-  model.now += 10 * RSC_DEFAULT_TOUT;
-  rscReceivePoll();
-}
 
 int main(int argc, char** argv) {
   int run = 0;
-  setvbuf(stdout, NULL, _IONBF, 0);
-  atexit(modelReset);                 // free what the last test left in the queues
-  for (const TestCase& t : tests) {
-    if ( argc > 1 && strcmp(argv[1], t.name) != 0 ) continue;
-    modelReset();
-    drainLibraryState();
-    modelReset();
+  printf("ReliableSerialComms %s host tests (MTU %d, %d slots, window %d, %d requests, CRC impl %d, stats %d)\n",
+         RSC_VERSION_STRING, RSC_MTU, RSC_TX_SLOTS, RSC_WINDOW, RSC_MAX_REQUESTS, RSC_CRC_IMPL, RSC_STATS);
+  for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
+    if ( argc > 1 && strcmp(argv[1], tests[i].name) != 0 ) continue;
     int before = failures;
-    t.fn();
-    printf("%s %s\n", failures == before ? "ok  " : "FAIL", t.name);
+    simNow = 1000;
+    tests[i].fn();
+    printf("%s %s\n", failures == before ? "ok  " : "FAIL", tests[i].name);
     run++;
   }
-  printf("%d tests, %d failed checks\n", run, failures);
+  printf("%d tests, %d failures\n", run, failures);
   return ( failures == 0 && run > 0 ) ? 0 : 1;
 }
