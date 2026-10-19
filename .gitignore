@@ -16,6 +16,9 @@ tests/host/test_rsc_wide
 tests/host/*.o
 tests/interop/c_peer
 
+# PlatformIO build output of the example projects
+.pio/
+
 # Python
 __pycache__/
 *.pyc

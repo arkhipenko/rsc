@@ -5,6 +5,7 @@
 #   (tests/interop/c_peer.c) over pipes, including a lossy pipe and a peer restart
 # - example sketches on arduino-esp32 3.x (ESP32, ESP32-C3), 2.0.17 (ESP32) and Arduino AVR (Uno)
 #   (examples/rsc_stm32 is an STM32CubeIDE fragment and is not compiled)
+# - the PlatformIO projects of RSC_Host and RSC_TwoLinks (esp32dev), as published
 # - Arduino Lint (the library is not in the Library Manager)
 
 name: CI
@@ -97,6 +98,15 @@ jobs:
           cli-compile-flags: |
             - --warnings
             - all
+
+  platformio:
+    name: PlatformIO (esp32dev)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: pipx install platformio
+      - run: pio run -d examples/RSC_Host
+      - run: pio run -d examples/RSC_TwoLinks
 
   lint:
     name: Arduino Lint

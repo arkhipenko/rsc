@@ -59,6 +59,28 @@ void loop() {
 
 `examples/RSC_Host` is a complete responder for any board (Uno included), and `python/examples/host_demo.py` talks to it from a computer. `examples/RSC_TwoLinks` runs two links on one ESP32 with FreeRTOS tasks and a blocking requester. `examples/rsc_stm32` is a fragment for STM32 HAL with FreeRTOS.
 
+## Quick start: PlatformIO (ESP32)
+
+`examples/RSC_Host` and `examples/RSC_TwoLinks` are also PlatformIO projects for a generic ESP32 board (`esp32dev`). Each `platformio.ini` sits next to its sketch (`src_dir = .`) and links the library from this repository (`symlink://../..`). Outside the repository, replace that line with the library's git URL.
+
+```
+pio run -d examples/RSC_Host -t upload --upload-port COM5
+python python/examples/host_demo.py COM5
+
+pio run -d examples/RSC_TwoLinks -t upload --upload-port COM5
+pio device monitor --port COM5
+```
+
+`RSC_TwoLinks` needs two wires: GPIO 19 to GPIO 16, and GPIO 17 to GPIO 18.
+
+The projects use the stock platform at a fixed version, `platformio/espressif32 @ 7.1.3` (Arduino core 2.0.17). For Arduino core 3.x, replace the platform line with the pioarduino platform:
+
+```ini
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.39/platform-espressif32.zip
+```
+
+NOTE: pioarduino and the stock platform share package names. On a machine that builds both, give each pioarduino project its own `platforms_dir` and `packages_dir`, or the Arduino core is installed again at every build.
+
 ## Quick start: Python
 
 ```python
@@ -267,7 +289,7 @@ CF94     - 0x94CF - CRC-16 over 5D 00 10 01 01 00 02
 
 - `tests/host`: the C library against a simulated wire that drops, flips and inserts bytes, cuts the line and restarts peers. 24 tests in three configurations (defaults; the AVR defaults; 16 slots with window 7 and the bitwise CRC), built with AddressSanitizer and UndefinedBehaviorSanitizer, plus a C++ syntax check. Run `make -C tests/host`.
 - `python/tests`: the same scenarios for the Python link, the shared golden frames, and interop tests against the C library (`tests/interop/c_peer.c`) over pipes, including a lossy pipe and a restart of the C side. Run `make -C tests/interop` and then `python -m pytest python/tests`.
-- CI (`.github/workflows/ci.yml`) runs both with gcc and clang and with Python 3.9 and 3.12, compiles the examples for ESP32, ESP32-C3 (arduino-esp32 3.x), ESP32 (2.0.17) and Arduino Uno, and runs Arduino Lint.
+- CI (`.github/workflows/ci.yml`) runs both with gcc and clang and with Python 3.9 and 3.12, compiles the examples for ESP32, ESP32-C3 (arduino-esp32 3.x), ESP32 (2.0.17) and Arduino Uno, builds the two PlatformIO projects, and runs Arduino Lint.
 - Nothing has run on hardware yet.
 
 ## Upgrading from 1.x
